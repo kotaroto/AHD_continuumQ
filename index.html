@@ -388,6 +388,7 @@ button.chip:hover{border-color:var(--bad)}
    Add &net=local to test on one computer with several tabs (no internet needed).
    ============================================================ */
 
+const APP_VERSION = '2.2';
 const QS = new URLSearchParams(location.search);
 const NET_LOCAL = QS.get('net') === 'local';
 const PEER_PREFIX = 'roundslive-v2-';
@@ -487,13 +488,17 @@ function confetti(n = 220) {
 /* ============================================================
    Transport. Every device connects OUT to a public message relay (MQTT over secure WebSocket),
    so there is no direct phone-to-laptop link for carriers or hospital firewalls to block.
-   The host listens on two relays at once; phones try the first and fall back to the second.
+   The host and every phone connect to all relays at once and use whichever ones get through.
    &net=local uses BroadcastChannel (several tabs on one computer, no internet needed).
    &broker=wss://… overrides the relay (for testing).
    Host:   hostTransport(code, {onReady, onMessage(cid,msg), onDisconnect(cid), onIdTaken, onNetIssue})
    Player: clientTransport(code, {onOpen, onMessage(msg), onClose, onError})
    ============================================================ */
-const BROKERS = QS.get('broker') ? [QS.get('broker')] : ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const BROKERS = QS.get('broker') ? QS.get('broker').split(',').map(url => ({ url })) : [
+  { url: 'wss://broker.emqx.io:8084/mqtt' },
+  { url: 'wss://public.cloud.shiftr.io:443', username: 'public', password: 'public' },   // standard web port: gets through strict Wi-Fi
+  { url: 'wss://broker.hivemq.com:8884/mqtt' }
+];
 const topicBase = code => 'roundslive/v2/' + String(code).toUpperCase();
 const mqttReady = () => typeof mqtt !== 'undefined' && typeof mqtt.connect === 'function';
 const MQTT_OPTS = { clean: true, keepalive: 20, reconnectPeriod: 2000, connectTimeout: 10000, protocolVersion: 4 };
@@ -513,8 +518,8 @@ function relayHost(code, h) {
   return {
     start() {
       if (!mqttReady()) { h.onNetIssue({ type: 'lib-missing' }); return; }
-      BROKERS.forEach((url, i) => {
-        const c = mqtt.connect(url, { ...MQTT_OPTS, clientId: 'rlh_' + uid(12) });
+      BROKERS.forEach(({ url, ...auth }, i) => {
+        const c = mqtt.connect(url, { ...MQTT_OPTS, ...auth, clientId: 'rlh_' + uid(12) });
         clients[i] = c;
         c.on('connect', () => {
           c._rlSubscribed = false;
@@ -543,33 +548,35 @@ function relayHost(code, h) {
   };
 }
 
-let relayAttempt = 0;
 function relayClient(code, h) {
   const base = topicBase(code), cid = 'c' + uid(14);
-  let closed = false, heard = false, opened = false, notFoundT = null;
+  let closed = false, heard = false, notFoundT = null;
   if (!mqttReady()) { setTimeout(() => h.onError({ type: 'lib-missing' })); return { send() {}, destroy() {} }; }
-  const url = BROKERS[relayAttempt++ % BROKERS.length];
-  const c = mqtt.connect(url, { ...MQTT_OPTS, clientId: 'rlp_' + uid(12) });
-  c.on('connect', () => {
-    c.subscribe(base + '/down/' + cid, { qos: 1 }, err => {
-      if (err || closed) return;
-      h.onOpen();   // (re)announce ourselves to the host on every (re)connect
-      if (!opened) {
-        opened = true;
-        // the host answers within a second when the game exists; silence means no lobby with this code
-        notFoundT = setTimeout(() => { if (!heard && !closed) h.onError({ type: 'peer-unavailable' }); }, 7000);
-      }
+  const live = c => c.connected && c._rlSubscribed;
+  const clients = BROKERS.map(({ url, ...auth }) => {
+    const c = mqtt.connect(url, { ...MQTT_OPTS, ...auth, clientId: 'rlp_' + uid(12) });
+    c.on('connect', () => {
+      c._rlSubscribed = false;
+      c.subscribe(base + '/down/' + cid, { qos: 1 }, err => {
+        if (err || closed) return;
+        c._rlSubscribed = true;
+        h.onOpen();   // (re)announce ourselves to the host whenever a relay (re)connects
+        // the host answers within a second or two when the game exists; silence on every relay means no lobby with this code
+        if (!notFoundT) notFoundT = setTimeout(() => { if (!heard && !closed) h.onError({ type: 'peer-unavailable' }); }, 9000);
+      });
     });
+    c.on('close', () => { c._rlSubscribed = false; });
+    c.on('message', (topic, payload) => {
+      if (closed) return;
+      let m; try { m = JSON.parse(payload.toString()); } catch { return; }
+      heard = true; h.onMessage(m);
+    });
+    c.on('error', () => {});
+    return c;
   });
-  c.on('message', (topic, payload) => {
-    if (closed) return;
-    let m; try { m = JSON.parse(payload.toString()); } catch { return; }
-    heard = true; h.onMessage(m);
-  });
-  c.on('error', () => {});
   return {
-    send(m) { if (c.connected) { try { c.publish(base + '/up/' + cid, JSON.stringify(m), { qos: 1 }); } catch {} } },
-    destroy() { closed = true; clearTimeout(notFoundT); try { c.end(true); } catch {} }
+    send(m) { const body = JSON.stringify(m); clients.forEach(c => { if (live(c)) { try { c.publish(base + '/up/' + cid, body, { qos: 1 }); } catch {} } }); },
+    destroy() { closed = true; clearTimeout(notFoundT); clients.forEach(c => { try { c.end(true); } catch {} }); }
   };
 }
 
@@ -717,7 +724,7 @@ const Host = {
       ? `<div class="banner"><p><b>Phones can't reach a file on this computer.</b> Put this page on a website (see the setup notes) and open it from there to host a real game. Practice bots still work here.</p></div>` : '';
     app.innerHTML = `
       <header class="topbar wrap">
-        <div class="brand"><span class="dot"></span>Rounds Live</div><span class="badge">Host</span>${localNote}
+        <div class="brand"><span class="dot"></span>Rounds Live</div><span class="badge">Host · v${APP_VERSION}</span>${localNote}
         <span class="spacer"></span>
         <button class="btn small ghost" data-act="export">Export all</button>
         <label class="btn small ghost" for="importfile">Import</label>
@@ -1014,6 +1021,8 @@ Explanation: optional      Time: 30      Image: https://… (optional)</pre>
   },
   join(cid, m) {
     const g = this.game;
+    const last = this.lastJoin || (this.lastJoin = new Map());
+    const now = Date.now(); if (now - (last.get(cid) || 0) < 1500) return; last.set(cid, now);
     const pid = String(m.pid || '');
     if (!/^[a-z0-9]{6,40}$/.test(pid)) return;
     const reply = msg => this.net.send(cid, msg);
@@ -1198,7 +1207,7 @@ Explanation: optional      Time: 30      Image: https://… (optional)</pre>
         <div class="brand"><span class="dot"></span>Rounds Live</div>
         ${g.phase !== 'lobby' && g.phase !== 'final' ? `<div class="joinpill">Join with code <span class="mono">${esc(g.code)}</span></div>` : ''}
         <span class="spacer"></span>
-        <span id="netstat">${this.netHtml()}</span>
+        <span class="hint mono">v${APP_VERSION}</span><span id="netstat">${this.netHtml()}</span>
         <span class="hint num" id="pc">${Object.keys(g.players).length} players</span>
         <button class="btn small ghost" data-act="sound" aria-pressed="${SFX.on}">${SFX.on ? 'Sound on' : 'Sound off'}</button>
         <button class="btn small ghost" data-act="full">Full screen</button>
@@ -1567,7 +1576,7 @@ const Player = {
       return this.shell(body, false);
     }
     if (s === 'notfound') {
-      body = `<div class="p-center"><div class="p-big">No game called ${esc(this.code)}</div><p class="p-sub">Check the code on the main screen. The host may not have opened the lobby yet.</p>
+      body = `<div class="p-center"><div class="p-big">No game called ${esc(this.code)}</div><p class="p-sub">Check the code on the main screen. If it matches, refresh the main screen and this page, and make sure both show version ${APP_VERSION}.</p><p class="hint mono">v${APP_VERSION}</p>
         <button class="btn primary big" data-act="retry">Try again</button><button class="linkbtn" data-act="leave">Enter a different code</button></div>`;
       return this.shell(body, false);
     }
@@ -1647,7 +1656,7 @@ const Player = {
           <p class="err" id="j-err" ${this.err ? '' : 'hidden'}>${esc(this.err)}</p>
           <button class="btn primary big" type="submit">Join game</button>
         </form>
-        <div class="landing-foot"><span class="note">Running the session?</span><a class="btn small ghost" href="?host${NET_LOCAL ? '&net=local' : ''}">Host a game on this screen</a></div>
+        <div class="landing-foot"><span class="note">Running the session? <span class="mono">v${APP_VERSION}</span></span><a class="btn small ghost" href="?host${NET_LOCAL ? '&net=local' : ''}">Host a game on this screen</a></div>
       </div>`;
     const c = $('#j-code');
     c.addEventListener('input', () => { const p = c.selectionStart; c.value = normCode(c.value); c.setSelectionRange(p, p); });
