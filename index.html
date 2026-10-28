@@ -378,7 +378,7 @@ button.chip:hover{border-color:var(--bad)}
 }
 </script>
 
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script>
 'use strict';
@@ -390,7 +390,7 @@ button.chip:hover{border-color:var(--bad)}
 
 const QS = new URLSearchParams(location.search);
 const NET_LOCAL = QS.get('net') === 'local';
-const PEER_PREFIX = 'roundslive-v1-';
+const PEER_PREFIX = 'roundslive-v2-';
 const BANK_KEY = 'roundslive.bank.v1';
 const GAME_KEY = 'roundslive.game.v1';
 const PROFILE_KEY = 'roundslive.profile';
@@ -485,64 +485,91 @@ function confetti(n = 220) {
 }
 
 /* ============================================================
-   Transport. Peer-to-peer via PeerJS (WebRTC) by default; BroadcastChannel with &net=local.
+   Transport. Every device connects OUT to a public message relay (MQTT over secure WebSocket),
+   so there is no direct phone-to-laptop link for carriers or hospital firewalls to block.
+   The host listens on two relays at once; phones try the first and fall back to the second.
+   &net=local uses BroadcastChannel (several tabs on one computer, no internet needed).
+   &broker=wss://… overrides the relay (for testing).
    Host:   hostTransport(code, {onReady, onMessage(cid,msg), onDisconnect(cid), onIdTaken, onNetIssue})
    Player: clientTransport(code, {onOpen, onMessage(msg), onClose, onError})
    ============================================================ */
-function hostTransport(code, h) { return NET_LOCAL ? localHost(code, h) : peerHost(code, h); }
-function clientTransport(code, h) { return NET_LOCAL ? localClient(code, h) : peerClient(code, h); }
+const BROKERS = QS.get('broker') ? [QS.get('broker')] : ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const topicBase = code => 'roundslive/v2/' + String(code).toUpperCase();
+const mqttReady = () => typeof mqtt !== 'undefined' && typeof mqtt.connect === 'function';
+const MQTT_OPTS = { clean: true, keepalive: 20, reconnectPeriod: 2000, connectTimeout: 10000, protocolVersion: 4 };
 
-function peerHost(code, h) {
-  const conns = new Map();
-  let peer = null, dead = false;
-  const api = {
-    start() {
-      if (typeof Peer !== 'function') { h.onNetIssue({ type: 'lib-missing' }); return; }
-      peer = new Peer(PEER_PREFIX + code.toLowerCase(), { debug: 1 });
-      peer.on('open', () => h.onReady());
-      peer.on('connection', conn => {
-        const id = conn.connectionId;
-        conn.on('open', () => conns.set(id, conn));
-        conn.on('data', d => { conns.set(id, conn); h.onMessage(id, d); });
-        conn.on('close', () => { conns.delete(id); h.onDisconnect(id); });
-        conn.on('error', () => {});
-      });
-      peer.on('disconnected', () => { if (!dead) setTimeout(() => { if (!dead && peer && !peer.destroyed) { try { peer.reconnect(); } catch {} } }, 1500); });
-      peer.on('error', err => {
-        if (dead) return;
-        if (err.type === 'unavailable-id') { h.onIdTaken(); return; }
-        if (err.type === 'peer-unavailable') return; // a player went away; harmless
-        h.onNetIssue(err);
-        setTimeout(() => {
-          if (dead) return;
-          if (peer.destroyed) { api.start(); } else if (peer.disconnected) { try { peer.reconnect(); } catch {} }
-        }, 3000);
-      });
-    },
-    send(id, msg) { const c = conns.get(id); if (c && c.open) { try { c.send(msg); } catch {} } },
-    drop(id) { const c = conns.get(id); conns.delete(id); try { c && c.close(); } catch {} },
-    destroy() { dead = true; try { peer && peer.destroy(); } catch {} }
+function hostTransport(code, h) { return NET_LOCAL ? localHost(code, h) : relayHost(code, h); }
+function clientTransport(code, h) { return NET_LOCAL ? localClient(code, h) : relayClient(code, h); }
+
+function relayHost(code, h) {
+  const base = topicBase(code), clients = [], route = new Map();
+  let dead = false, lastUp = null;
+  const status = () => {
+    if (dead) return;
+    const up = clients.some(c => c && c.connected && c._rlSubscribed);
+    if (up === lastUp) return; lastUp = up;
+    if (up) h.onReady(); else h.onNetIssue({ type: 'network' });
   };
-  return api;
+  return {
+    start() {
+      if (!mqttReady()) { h.onNetIssue({ type: 'lib-missing' }); return; }
+      BROKERS.forEach((url, i) => {
+        const c = mqtt.connect(url, { ...MQTT_OPTS, clientId: 'rlh_' + uid(12) });
+        clients[i] = c;
+        c.on('connect', () => {
+          c._rlSubscribed = false;
+          c.subscribe(base + '/up/+', { qos: 1 }, err => { if (!err) { c._rlSubscribed = true; } status(); });
+        });
+        c.on('message', (topic, payload) => {
+          if (dead) return;
+          const cid = topic.slice(base.length + 4);
+          if (!/^[a-z0-9]{6,40}$/.test(cid)) return;
+          let m; try { m = JSON.parse(payload.toString()); } catch { return; }
+          route.set(cid, i);
+          h.onMessage(cid, m);
+        });
+        c.on('close', () => { c._rlSubscribed = false; status(); });
+        c.on('offline', () => { c._rlSubscribed = false; status(); });
+        c.on('error', () => {});
+      });
+      setTimeout(() => { if (lastUp === null) { lastUp = false; h.onNetIssue({ type: 'network' }); } }, 12000);
+    },
+    send(cid, msg) {
+      const c = clients[route.get(cid)];
+      if (c && c.connected) { try { c.publish(base + '/down/' + cid, JSON.stringify(msg), { qos: 1 }); } catch {} }
+    },
+    drop(cid) { route.delete(cid); },
+    destroy() { dead = true; clients.forEach(c => { try { c.end(true); } catch {} }); }
+  };
 }
 
-function peerClient(code, h) {
-  let peer = null, conn = null, closed = false;
-  if (typeof Peer !== 'function') { setTimeout(() => h.onError({ type: 'lib-missing' })); return { send() {}, destroy() {} }; }
-  peer = new Peer({ debug: 1 });
-  peer.on('open', () => {
-    if (closed) return;
-    conn = peer.connect(PEER_PREFIX + code.toLowerCase(), { reliable: true, serialization: 'json' });
-    conn.on('open', () => { if (!closed) h.onOpen(); });
-    conn.on('data', d => { if (!closed) h.onMessage(d); });
-    conn.on('close', () => { if (!closed) h.onClose(); });
-    conn.on('error', e => { if (!closed) h.onError(e); });
+let relayAttempt = 0;
+function relayClient(code, h) {
+  const base = topicBase(code), cid = 'c' + uid(14);
+  let closed = false, heard = false, opened = false, notFoundT = null;
+  if (!mqttReady()) { setTimeout(() => h.onError({ type: 'lib-missing' })); return { send() {}, destroy() {} }; }
+  const url = BROKERS[relayAttempt++ % BROKERS.length];
+  const c = mqtt.connect(url, { ...MQTT_OPTS, clientId: 'rlp_' + uid(12) });
+  c.on('connect', () => {
+    c.subscribe(base + '/down/' + cid, { qos: 1 }, err => {
+      if (err || closed) return;
+      h.onOpen();   // (re)announce ourselves to the host on every (re)connect
+      if (!opened) {
+        opened = true;
+        // the host answers within a second when the game exists; silence means no lobby with this code
+        notFoundT = setTimeout(() => { if (!heard && !closed) h.onError({ type: 'peer-unavailable' }); }, 7000);
+      }
+    });
   });
-  peer.on('error', err => { if (!closed) h.onError(err); });
-  peer.on('disconnected', () => { if (!closed) { try { peer.reconnect(); } catch {} } });
+  c.on('message', (topic, payload) => {
+    if (closed) return;
+    let m; try { m = JSON.parse(payload.toString()); } catch { return; }
+    heard = true; h.onMessage(m);
+  });
+  c.on('error', () => {});
   return {
-    send(m) { if (conn && conn.open) { try { conn.send(m); } catch {} } },
-    destroy() { closed = true; try { peer.destroy(); } catch {} }
+    send(m) { if (c.connected) { try { c.publish(base + '/up/' + cid, JSON.stringify(m), { qos: 1 }); } catch {} } },
+    destroy() { closed = true; clearTimeout(notFoundT); try { c.end(true); } catch {} }
   };
 }
 
@@ -1204,7 +1231,7 @@ Explanation: optional      Time: 30      Image: https://… (optional)</pre>
   },
   joinUrl() {
     const u = new URL(location.href); u.search = ''; u.hash = '';
-    u.searchParams.set('join', this.game.code); if (NET_LOCAL) u.searchParams.set('net', 'local');
+    u.searchParams.set('join', this.game.code); if (NET_LOCAL) u.searchParams.set('net', 'local'); if (QS.get('broker')) u.searchParams.set('broker', QS.get('broker'));
     return u.toString();
   },
   qrSvg(text) {
@@ -1470,7 +1497,7 @@ const Player = {
   leave() {
     this.attempt++; if (this.net) this.net.destroy(); this.net = null;
     LS.del(ME_KEY(this.code)); this.joined = false; this.everJoined = false; this.view = null; this.status = 'form';
-    history.replaceState(null, '', location.pathname + (NET_LOCAL ? '?net=local' : ''));
+    { const u = new URL(location.href); u.searchParams.delete('join'); history.replaceState(null, '', location.pathname + u.search); }
     this.render();
   },
   onMsg(m) {
@@ -1481,7 +1508,7 @@ const Player = {
         this.joined = true; this.everJoined = true; this.retry = 0; this.status = 'joined';
         this.name = m.name || this.name; this.avatar = m.avatar || this.avatar;
         LS.set(ME_KEY(this.code), { pid: this.pid, name: this.name, avatar: this.avatar, at: Date.now() });
-        if (!/[?&]join=/.test(location.search)) history.replaceState(null, '', `?join=${this.code}${NET_LOCAL ? '&net=local' : ''}`);
+        if (!/[?&]join=/.test(location.search)) { const u = new URL(location.href); u.searchParams.set('join', this.code); history.replaceState(null, '', u.search); }
         keepAwake(); this.render(); break;
       case 'reject':
         this.attempt++; this.net.destroy(); this.status = 'form';
